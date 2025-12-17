@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
 	"github.com/chromedp/chromedp"
 )
 
@@ -15,33 +18,60 @@ const htmlOutputFilename = "scraped_output.html"
 const screenshotFilename = "screenshot.png"
 const urlListFilename = "extracted_urls.txt"
 const logFilename = "logs.txt"
+const targetsFilename = "targets.txt"
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Printf("Kullanım: %s <hedef_URL>\n", os.Args[0])
-		log.Fatal("Lütfen hedef URL'yi komut satırı argümanı olarak sağlayın.")
+	var targets []string
+
+	if len(os.Args) > 1 {
+		targets = append(targets, os.Args[1])
+	} else {
+		file, err := os.Open(targetsFilename)
+		if err != nil {
+			fmt.Println("Kullanım: program <hedef_url> veya ana dizinde targets.txt dosyası olmalı")
+			return
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" {
+				targets = append(targets, line)
+			}
+		}
+
+		if len(targets) == 0 {
+			fmt.Println("targets.txt bulundu ancak içinde URL yok.")
+			return
+		}
 	}
-	targetURL := os.Args[1]
+	for _, url := range targets {
+		processURL(url)
+	}
+}
+
+func processURL(targetURL string) {
 	operationTime := time.Now().Format("2006-01-02_15-04-05")
 	outputDir := fmt.Sprintf("outputs/%s_%s", operationTime, sanitizeURL(targetURL))
 
-	// Klasörü oluştur
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		log.Fatalf("Klasör oluşturulamadı: %v", err)
+		log.Printf("Klasör oluşturulamadı: %v", err)
+		return
 	}
 
-	logFile, err := os.OpenFile(filepath.Join("outputs", logFilename), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile, err := os.OpenFile(filepath.Join("outputs", logFilename),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Fatalf("Log dosyası açılamadı: %v", err)
+		log.Printf("Log dosyası açılamadı: %v", err)
+		cleanup(outputDir)
+		return
 	}
 	defer logFile.Close()
 
-	log.Printf("İşlem başlatıldı: %s - %s\n", operationTime, targetURL)
+	log.Printf("İşlem başlatıldı: %s - %s", operationTime, targetURL)
 
-	ctx, cancel := chromedp.NewContext(
-		context.Background(),
-		chromedp.WithLogf(log.Printf),
-	)
+	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
 	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
@@ -50,8 +80,6 @@ func main() {
 	var htmlContent string
 	var screenshotData []byte
 	var links []string
-
-	fmt.Printf("Hedef URL'ye bağlanılıyor: %s\n", targetURL)
 
 	err = chromedp.Run(ctx,
 		chromedp.Navigate(targetURL),
@@ -62,10 +90,8 @@ func main() {
 			let urls = [];
 			document.querySelectorAll('a').forEach(link => {
 				try {
-					let absoluteUrl = new URL(link.href, document.baseURI).href;
-					if (absoluteUrl && urls.indexOf(absoluteUrl) === -1) {
-						urls.push(absoluteUrl);
-					}
+					let u = new URL(link.href, document.baseURI).href;
+					if (urls.indexOf(u) === -1) urls.push(u);
 				} catch (e) {}
 			});
 			urls;
@@ -73,84 +99,52 @@ func main() {
 	)
 
 	if err != nil {
-		result := "Bilinmeyen hata"
-
-		if err == context.DeadlineExceeded {
-			result = "Zaman aşımı"
-		} else {
-			result = err.Error()
-		}
-
-		logToFile(false, logFile, operationTime, targetURL, "Başarısız: "+result)
+		logToFile(false, logFile, operationTime, targetURL, err.Error())
 		cleanup(outputDir)
-
-		log.Printf("Error: İşlem sırasında hata oluştu: %v", err)
 		return
 	}
 
 	if err := saveFile(outputDir, htmlOutputFilename, []byte(htmlContent)); err != nil {
-		log.Printf("Error: HTML içeriği kaydedilemedi: %v", err)
+		logToFile(false, logFile, operationTime, targetURL, "HTML kaydedilemedi")
 		cleanup(outputDir)
-		logToFile(false, logFile, operationTime, targetURL, "HTML içeriği kaydedilemedi")
 		return
 	}
-	logToFile(true, logFile, operationTime, targetURL, fmt.Sprintf("HTML içeriği '%s' dosyasına kaydedildi.", htmlOutputFilename))
-
 
 	if err := saveFile(outputDir, screenshotFilename, screenshotData); err != nil {
-		log.Printf("Error: Ekran görüntüsü kaydedilemedi: %v", err)
+		logToFile(false, logFile, operationTime, targetURL, "Screenshot kaydedilemedi")
 		cleanup(outputDir)
-		logToFile(false, logFile, operationTime, targetURL, "Ekran görüntüsü kaydedilemedi")
 		return
 	}
-	logToFile(true, logFile, operationTime, targetURL, fmt.Sprintf("Ekran görüntüsü '%s' dosyasına kaydedildi.", screenshotFilename))
 
-
-	linkContent := ""
-	for _, link := range links {
-		linkContent += link + "\n"
-	}
-
+	linkContent := strings.Join(links, "\n")
 	if err := saveFile(outputDir, urlListFilename, []byte(linkContent)); err != nil {
-		log.Printf("Error: URL listesi kaydedilemedi: %v", err)
-		cleanup(outputDir)
 		logToFile(false, logFile, operationTime, targetURL, "URL listesi kaydedilemedi")
+		cleanup(outputDir)
 		return
 	}
-	logToFile(true, logFile, operationTime, targetURL, fmt.Sprintf("%d adet URL '%s' dosyasına kaydedildi.", len(links), urlListFilename))
 
 	logToFile(true, logFile, operationTime, targetURL, "İşlem başarılı")
 }
 
 func saveFile(outputDir, filename string, data []byte) error {
-	fullPath := filepath.Join(outputDir, filename)
-	return ioutil.WriteFile(fullPath, data, 0644)
+	return ioutil.WriteFile(filepath.Join(outputDir, filename), data, 0644)
 }
 
 func cleanup(outputDir string) {
-	if err := os.RemoveAll(outputDir); err != nil {
-		log.Printf("Error: Klasör silinemedi: %v", err)
-	}
+	_ = os.RemoveAll(outputDir)
 }
 
 func logToFile(status bool, logFile *os.File, operationTime, targetURL, message string) error {
-	statusMsg := "OK"
+	statusMsg := "ERR"
 	if status {
-		statusMsg = "ERR"
+		statusMsg = "OK"
 	}
-
-	logMessage := fmt.Sprintf(
-		"%s | %s - %s - %s\n",
-		statusMsg,
-		operationTime,
-		targetURL,
-		message,
+	_, err := logFile.WriteString(
+		fmt.Sprintf("%s | %s - %s - %s\n", statusMsg, operationTime, targetURL, message),
 	)
-
-	_, err := logFile.WriteString(logMessage)
 	return err
 }
 
 func sanitizeURL(url string) string {
-	return filepath.Base(url)
+	return strings.NewReplacer("https://", "", "http://", "", "/", "_").Replace(url)
 }
