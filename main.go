@@ -11,14 +11,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
 
-const htmlOutputFilename = "scraped_output.html"
-const screenshotFilename = "screenshot.png"
-const urlListFilename = "extracted_urls.txt"
-const logFilename = "logs.txt"
-const targetsFilename = "targets.txt"
+const (
+	htmlOutputFilename = "scraped_output.html"
+	screenshotFilename = "screenshot.png"
+	urlListFilename    = "extracted_urls.txt"
+	logFilename        = "logs.txt"
+	targetsFilename    = "targets.txt"
+)
 
 func main() {
 	var targets []string
@@ -28,7 +31,7 @@ func main() {
 	} else {
 		file, err := os.Open(targetsFilename)
 		if err != nil {
-			fmt.Println("Kullanım: program <hedef_url> veya ana dizinde targets.txt dosyası olmalı")
+			fmt.Println("Kullanım: program <hedef_url> veya targets.txt dosyası olmalı")
 			return
 		}
 		defer file.Close()
@@ -42,10 +45,11 @@ func main() {
 		}
 
 		if len(targets) == 0 {
-			fmt.Println("targets.txt bulundu ancak içinde URL yok.")
+			fmt.Println("targets.txt boş.")
 			return
 		}
 	}
+
 	for _, url := range targets {
 		processURL(url)
 	}
@@ -69,19 +73,31 @@ func processURL(targetURL string) {
 	}
 	defer logFile.Close()
 
-	log.Printf("İşlem başlatıldı: %s - %s", operationTime, targetURL)
-
 	ctx, cancel := chromedp.NewContext(context.Background())
 	defer cancel()
 
 	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	var htmlContent string
-	var screenshotData []byte
-	var links []string
+	var (
+		htmlContent   string
+		screenshotData []byte
+		links         []string
+		statusCode    int64 = -1
+	)
+
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		if resp, ok := ev.(*network.EventResponseReceived); ok {
+			if resp.Type == network.ResourceTypeDocument {
+				statusCode = int64(resp.Response.Status)
+			}
+		}
+	})
 
 	err = chromedp.Run(ctx,
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return network.Enable().Do(ctx)
+		}),
 		chromedp.Navigate(targetURL),
 		chromedp.Sleep(2*time.Second),
 		chromedp.OuterHTML("html", &htmlContent),
@@ -91,7 +107,7 @@ func processURL(targetURL string) {
 			document.querySelectorAll('a').forEach(link => {
 				try {
 					let u = new URL(link.href, document.baseURI).href;
-					if (urls.indexOf(u) === -1) urls.push(u);
+					if (!urls.includes(u)) urls.push(u);
 				} catch (e) {}
 			});
 			urls;
@@ -99,31 +115,35 @@ func processURL(targetURL string) {
 	)
 
 	if err != nil {
-		logToFile(false, logFile, operationTime, targetURL, err.Error())
+		logToFile(false, logFile, operationTime, targetURL,
+			fmt.Sprintf("Chromedp hatası: %s | HTTP Status: %d", err.Error(), statusCode))
 		cleanup(outputDir)
 		return
 	}
 
 	if err := saveFile(outputDir, htmlOutputFilename, []byte(htmlContent)); err != nil {
-		logToFile(false, logFile, operationTime, targetURL, "HTML kaydedilemedi")
+		logToFile(false, logFile, operationTime, targetURL,
+			fmt.Sprintf("HTML kaydedilemedi | HTTP Status: %d", statusCode))
 		cleanup(outputDir)
 		return
 	}
 
 	if err := saveFile(outputDir, screenshotFilename, screenshotData); err != nil {
-		logToFile(false, logFile, operationTime, targetURL, "Screenshot kaydedilemedi")
+		logToFile(false, logFile, operationTime, targetURL,
+			fmt.Sprintf("Screenshot kaydedilemedi | HTTP Status: %d", statusCode))
 		cleanup(outputDir)
 		return
 	}
 
-	linkContent := strings.Join(links, "\n")
-	if err := saveFile(outputDir, urlListFilename, []byte(linkContent)); err != nil {
-		logToFile(false, logFile, operationTime, targetURL, "URL listesi kaydedilemedi")
+	if err := saveFile(outputDir, urlListFilename, []byte(strings.Join(links, "\n"))); err != nil {
+		logToFile(false, logFile, operationTime, targetURL,
+			fmt.Sprintf("URL listesi kaydedilemedi | HTTP Status: %d", statusCode))
 		cleanup(outputDir)
 		return
 	}
 
-	logToFile(true, logFile, operationTime, targetURL, "İşlem başarılı")
+	logToFile(true, logFile, operationTime, targetURL,
+		fmt.Sprintf("İşlem başarılı | HTTP Status: %d", statusCode))
 }
 
 func saveFile(outputDir, filename string, data []byte) error {
@@ -146,5 +166,10 @@ func logToFile(status bool, logFile *os.File, operationTime, targetURL, message 
 }
 
 func sanitizeURL(url string) string {
-	return strings.NewReplacer("https://", "", "http://", "", "/", "_").Replace(url)
+	return strings.NewReplacer(
+		"https://", "",
+		"http://", "",
+		"/", "_",
+		":", "_",
+	).Replace(url)
 }
