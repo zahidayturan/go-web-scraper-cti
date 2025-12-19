@@ -18,11 +18,8 @@ go run main.go https://google.com
 ```
 
 ### 2. Run with multiple URLs
-Create a **targets.txt** file in the project root:
-```bash
-https://google.com
-https://github.com
-```
+Check if **targets.txt** exists in the root directory; if not, create it and populate it with the target URLs, each on a new line.
+
 Then run:
 ```bash
 go run main.go
